@@ -1,8 +1,10 @@
 # K-Means Benchmark: Serial vs Parallel (OpenMP)
 
 **Proyecto Apertura — Cómputo Paralelo y en la Nube, ITAM 2026**
-- Alejandro Castillo & Saul Rojas - 
-This project benchmarks the performance of K-Means clustering algorithms in serial and parallel implementations using OpenMP. It compares execution times across different data sizes, dimensions (2D and 3D), and thread counts to demonstrate speedup from parallelization.
+
+---Alejandro Castillo & Saul Rojas--- 
+  
+- This project benchmarks the performance of K-Means clustering algorithms in serial and parallel implementations using OpenMP. It compares execution times across different data sizes, dimensions (2D and 3D), and thread counts to demonstrate speedup from parallelization.
 
 ## Features
 
