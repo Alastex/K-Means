@@ -1,0 +1,66 @@
+# Python bytecode y caché
+__pycache__/
+*.py[cod]
+*$py.class
+*.pyc
+*.pyo
+*.pyd
+
+# Entornos virtuales
+.env
+.venv
+env/
+venv/
+ENV/
+env.bak/
+venv.bak/
+.python-version
+
+# Variables de entorno / configuración local
+*.env
+.env.*
+!.env.example
+
+# Binarios y ejecutables
+*.exe
+*.dll
+*.so
+*.dylib
+*.bin
+*.out
+*.o
+*.a
+
+# Datos — CSVs y similares
+*.csv
+*.tsv
+*.parquet
+*.feather
+*.pkl
+*.pickle
+
+# Distribución y empaquetado
+dist/
+build/
+*.egg-info/
+*.egg
+.eggs/
+wheels/
+
+# Herramientas de testing y cobertura
+.pytest_cache/
+.coverage
+htmlcov/
+.tox/
+.nox/
+
+# IDEs y editores
+.vscode/
+.idea/
+*.swp
+*.swo
+.DS_Store
+
+# Jupyter
+.ipynb_checkpoints/
+*.ipynb_checkpoints

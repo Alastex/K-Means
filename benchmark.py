@@ -41,9 +41,11 @@ from sklearn.datasets import make_blobs
 try:
     # Matplotlib solo es necesario si se generan gráficos.
     import matplotlib
+
     matplotlib.use("Agg")  # Uso de backend sin GUI para scripts
     import matplotlib.pyplot as plt
     import matplotlib.ticker as ticker
+
     HAS_PLOT = True
 except ImportError:
     # Si matplotlib no está instalado, se continúa sin las gráficas.
@@ -55,10 +57,10 @@ except ImportError:
 #  Ensure using virtual environment
 # ─────────────────────────────────────────────
 script_dir = os.path.dirname(os.path.abspath(__file__))
-if sys.platform == 'win32':
-    venv_python = os.path.join(script_dir, '.venv', 'Scripts', 'python.exe')
+if sys.platform == "win32":
+    venv_python = os.path.join(script_dir, ".venv", "Scripts", "python.exe")
 else:
-    venv_python = os.path.join(script_dir, '.venv', 'bin', 'python')
+    venv_python = os.path.join(script_dir, ".venv", "bin", "python")
 
 if sys.executable != venv_python:
     subprocess.run([venv_python, __file__] + sys.argv[1:])
@@ -69,22 +71,31 @@ if sys.executable != venv_python:
 #  Parametros globales (pueden sobreescribirse via CLI)
 # ─────────────────────────────────────────────
 # Configuración por defecto del benchmark
-POINT_SIZES  = [100_000, 200_000, 300_000, 400_000, 600_000, 800_000, 1_000_000]
-K            = 8      # número de clusters a usar
-MAX_ITER     = 300    # iteraciones máximas por ejecución de k-means
-REPS         = 10     # número de repeticiones por configuración (promediadas)
-SEED         = 42     # semilla determinista para reproducción
+# Tamaños exactos del experimento (PDF del proyecto)
+POINT_SIZES = [100_000, 200_000, 300_000, 400_000, 600_000, 800_000, 1_000_000]
+K = 8  # número de clusters a usar
+MAX_ITER = 300  # iteraciones máximas por ejecución de k-means
+REPS = 10  # número de repeticiones por configuración (promediadas)
+SEED = 42  # semilla determinista para reproducción
 
 # Rutas de binarios. En Windows el .exe se requiere.
-SERIAL_BIN   = "./kmeans_serial.exe"
-PARALLEL_BIN = "./kmeans_parallel.exe"
+SERIAL_BIN = "./kmeans_serial"
+PARALLEL_BIN = "./kmeans_parallel"
 
-DATA_DIR     = "./data"       # carpeta para datasets generados
+DATA_DIR = "./data"  # carpeta para datasets generados
 RESULTS_FILE = "results.csv"  # salida resumen de benchmark
 
 # Colores y marcadores para gráficas de matplotlib
-COLORS  = ["#1565C0", "#2E7D32", "#C62828", "#6A1B9A",
-           "#E65100", "#00695C", "#AD1457", "#37474F"]
+COLORS = [
+    "#1565C0",
+    "#2E7D32",
+    "#C62828",
+    "#6A1B9A",
+    "#E65100",
+    "#00695C",
+    "#AD1457",
+    "#37474F",
+]
 MARKERS = ["o", "s", "^", "D", "v", "P", "*", "X"]
 
 
@@ -110,7 +121,7 @@ def load_external_csv(path):
         print(f"[ERROR] Archivo CSV no encontrado: {path}")
         sys.exit(1)
 
-    with open(path, 'r') as f:
+    with open(path, "r") as f:
         reader = csv.reader(f)
         rows = list(reader)
 
@@ -135,11 +146,19 @@ def generate_csv(n_points, dims, seed=SEED):
 
     print(f"\n  Generando {n_points:,} puntos {dims}D ...", end=" ", flush=True)
 
-    # Genera puntos con clusters controlados
-    pts = make_blobs(n_samples=n_points, centers=K, n_features=dims,
-                     cluster_std=0.04, random_state=seed, center_box=(0, 1.0))[0]
-
-    # Siempre valores positivos y redondeados para consistencia en datos
+    # Parámetros exactos del notebook synthetic_clusters_kmeans.ipynb:
+    #   cluster_std=0.04  → clusters compactos, bien separados
+    #   random_state=7    → misma semilla que el notebook
+    #   center_box=(0,1)  → centros en el cubo unitario
+    #   np.abs + round 3  → solo valores positivos, 3 decimales
+    pts, _ = make_blobs(
+        n_samples=n_points,
+        centers=K,
+        n_features=dims,
+        cluster_std=0.04,
+        random_state=7,
+        center_box=(0, 1.0),
+    )
     pts = np.round(np.abs(pts), 3)
     np.savetxt(path, pts, delimiter=",", fmt="%.3f")
 
@@ -151,17 +170,30 @@ def generate_csv(n_points, dims, seed=SEED):
 #  Ejecucion de binarios
 # ─────────────────────────────────────────────
 def run_binary(cmd):
-    # Ejecuta un comando externo (kmeans_serial.exe / kmeans_parallel.exe)
-    # y mide el tiempo de ejecución.
-    t0 = time.perf_counter()
-    res = subprocess.run(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
-    elapsed = time.perf_counter() - t0
+    # FIX 2: Parsear el tiempo reportado por el propio binario C++
+    # en lugar de medirlo desde Python con perf_counter().
+    #
+    # El binario imprime una línea con "tiempo=X.XXXXs".
+    # Usando ese valor se elimina el overhead del fork del subproceso
+    # (~50ms en Linux) que distorsiona mediciones cortas.
+    res = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
 
-    # Si hubo error en el proceso, se informa y se devuelve NaN
     if res.returncode != 0:
         print(f"\n[ERROR] {' '.join(cmd)}\n{res.stderr.decode()}")
         return float("nan")
-    return elapsed
+
+    # Buscar "tiempo=X.XXXXs" en la salida del binario
+    import re
+
+    output = res.stdout.decode()
+    match = re.search(r"tiempo=([0-9]+\.?[0-9]*)s", output)
+    if match:
+        return float(match.group(1))
+
+    # Fallback: si el binario no imprime el tiempo, medir desde Python
+    # (no debería pasar con nuestros binarios)
+    print(f"[WARN] No se encontro 'tiempo=' en stdout de {cmd[0]}")
+    return float("nan")
 
 
 def run_serial(csv_path):
@@ -177,7 +209,9 @@ def run_serial(csv_path):
 def run_parallel(csv_path, threads):
     # Ejecuta el binario paralelo con el número de hilos deseado.
     # Comparado al serial, este invoca un proceso OpenMP que usa `threads`.
-    return run_binary([PARALLEL_BIN, csv_path, str(K), str(threads), str(MAX_ITER), str(SEED)])
+    return run_binary(
+        [PARALLEL_BIN, csv_path, str(K), str(threads), str(MAX_ITER), str(SEED)]
+    )
 
 
 # ─────────────────────────────────────────────
@@ -208,25 +242,42 @@ def run_experiment(reps, thread_configs, dims, n_sizes, input_csv):
             st = [run_serial(path) for _ in range(reps)]  # repeticiones para promedio
             t_serial = float(np.nanmean(st))
             print(f"media = {t_serial:.3f}s  std = {np.nanstd(st):.3f}s")
-            records.append(dict(
-                dim=dim, n=n, version="serial", threads=1,
-                t_mean=t_serial, t_std=float(np.nanstd(st)),
-                speedup=1.0, raw=st
-            ))
+            records.append(
+                dict(
+                    dim=dim,
+                    n=n,
+                    version="serial",
+                    threads=1,
+                    t_mean=t_serial,
+                    t_std=float(np.nanstd(st)),
+                    speedup=1.0,
+                    raw=st,
+                )
+            )
 
             # Paralelo
             for threads in thread_configs:
-                print(f"    Paralelo {threads:>2} hilos ({reps} reps) ...",
-                      end=" ", flush=True)
+                print(
+                    f"    Paralelo {threads:>2} hilos ({reps} reps) ...",
+                    end=" ",
+                    flush=True,
+                )
                 pt = [run_parallel(path, threads) for _ in range(reps)]
                 t_par = float(np.nanmean(pt))
                 sp = t_serial / t_par if t_par > 0 else float("nan")
                 print(f"media = {t_par:.3f}s  speedup = {sp:.2f}x")
-                records.append(dict(
-                    dim=dim, n=n, version="parallel", threads=threads,
-                    t_mean=t_par, t_std=float(np.nanstd(pt)),
-                    speedup=sp, raw=pt
-                ))
+                records.append(
+                    dict(
+                        dim=dim,
+                        n=n,
+                        version="parallel",
+                        threads=threads,
+                        t_mean=t_par,
+                        t_std=float(np.nanstd(pt)),
+                        speedup=sp,
+                        raw=pt,
+                    )
+                )
 
     return records
 
@@ -240,16 +291,33 @@ def save_results(records, reps):
     rep_cols = [f"rep_{i+1}" for i in range(reps)]
     with open(RESULTS_FILE, "w", newline="") as f:
         w = csv.writer(f)
-        w.writerow(["dim", "n_points", "version", "threads",
-                    "time_mean_s", "time_std_s", "speedup"] + rep_cols)
+        w.writerow(
+            [
+                "dim",
+                "n_points",
+                "version",
+                "threads",
+                "time_mean_s",
+                "time_std_s",
+                "speedup",
+            ]
+            + rep_cols
+        )
         for r in records:
             # Si la carrera devolvió menos repeticiones, completar con NaN
             raw = r["raw"] + [float("nan")] * max(0, reps - len(r["raw"]))
-            w.writerow([
-                r["dim"], r["n"], r["version"], r["threads"],
-                round(r["t_mean"], 5), round(r["t_std"], 5),
-                round(r["speedup"], 4)
-            ] + [round(t, 5) for t in raw[:reps]])
+            w.writerow(
+                [
+                    r["dim"],
+                    r["n"],
+                    r["version"],
+                    r["threads"],
+                    round(r["t_mean"], 5),
+                    round(r["t_std"], 5),
+                    round(r["speedup"], 4),
+                ]
+                + [round(t, 5) for t in raw[:reps]]
+            )
     print(f"\n[IO] {RESULTS_FILE}")
 
 
@@ -261,14 +329,34 @@ def get_speedup_curve(records, dim, threads):
     # x = tamaño en millones de puntos, y = speedup relativo frente al serial.
     xs, ys, errs = [], [], []
     for n in sorted(set(r["n"] for r in records)):
-        s = next((r for r in records if r["dim"]==dim and r["n"]==n
-                  and r["version"]=="serial"), None)
-        p = next((r for r in records if r["dim"]==dim and r["n"]==n
-                  and r["version"]=="parallel" and r["threads"]==threads), None)
+        s = next(
+            (
+                r
+                for r in records
+                if r["dim"] == dim and r["n"] == n and r["version"] == "serial"
+            ),
+            None,
+        )
+        p = next(
+            (
+                r
+                for r in records
+                if r["dim"] == dim
+                and r["n"] == n
+                and r["version"] == "parallel"
+                and r["threads"] == threads
+            ),
+            None,
+        )
         if s and p and p["t_mean"] > 0 and not np.isnan(p["t_mean"]):
-            sp   = s["t_mean"] / p["t_mean"]
+            sp = s["t_mean"] / p["t_mean"]
             # Error de propagación de la división (asumiendo incertidumbres de t_std)
-            rerr = np.sqrt((s["t_std"]/s["t_mean"])**2 + (p["t_std"]/p["t_mean"])**2) * sp
+            rerr = (
+                np.sqrt(
+                    (s["t_std"] / s["t_mean"]) ** 2 + (p["t_std"] / p["t_mean"]) ** 2
+                )
+                * sp
+            )
             xs.append(n / 1_000_000)
             ys.append(sp)
             errs.append(rerr)
@@ -283,21 +371,34 @@ def plot_speedup(records, dim, ax, thread_configs):
     for i, threads in enumerate(thread_configs):
         xs, ys, errs = get_speedup_curve(records, dim, threads)
         if xs:
-            ax.errorbar(xs, ys, yerr=errs,
-                        label=f"{threads} hilo{'s' if threads>1 else ''}",
-                        color=COLORS[i % len(COLORS)],
-                        marker=MARKERS[i % len(MARKERS)],
-                        linewidth=2, markersize=7, capsize=4)
+            ax.errorbar(
+                xs,
+                ys,
+                yerr=errs,
+                label=f"{threads} hilo{'s' if threads>1 else ''}",
+                color=COLORS[i % len(COLORS)],
+                marker=MARKERS[i % len(MARKERS)],
+                linewidth=2,
+                markersize=7,
+                capsize=4,
+            )
 
     # Línea de referencia de speedup 1.5 (puede ser utilidad visual)
-    ax.axhline(1.5, color="red", linestyle="--", linewidth=1.5, alpha=0.8,
-               label="Minimo requerido (1.5x)")
+    ax.axhline(
+        1.5,
+        color="red",
+        linestyle="--",
+        linewidth=1.5,
+        alpha=0.8,
+        label="Minimo requerido (1.5x)",
+    )
     ax.axhline(1.0, color="gray", linestyle=":", linewidth=1, alpha=0.4)
     ax.set_xlabel("Puntos (millones)", fontsize=11)
     ax.set_ylabel("Speedup  (T_serial / T_paralelo)", fontsize=11)
-    ax.set_title(f"Speedup K-Means OpenMP — {dim}D  (k={K})",
-                 fontsize=12, fontweight="bold")
-    ax.legend(fontsize=9, loc="upper left")
+    ax.set_title(
+        f"Speedup K-Means OpenMP — {dim}D  (k={K})", fontsize=12, fontweight="bold"
+    )
+    ax.legend(fontsize=9, loc="upper right")
     ax.grid(True, alpha=0.3)
     ax.set_ylim(bottom=0)
     ax.xaxis.set_major_formatter(ticker.FormatStrFormatter("%.1fM"))
@@ -305,40 +406,73 @@ def plot_speedup(records, dim, ax, thread_configs):
 
 def plot_times(records, dim, ax, thread_configs):
     # Grafica los tiempos de ejecución (tiempo medio) de serial y cada paralelo.
-    xs = sorted(set(r["n"] for r in records))
+    # FIX: filtrar por dim para no mezclar tamaños de 2D y 3D en el mismo eje
+    xs = sorted(set(r["n"] for r in records if r["dim"] == dim))
     xp = [n / 1_000_000 for n in xs]  # eje x en millones de puntos
 
-    ys = [next((r["t_mean"] for r in records if r["dim"]==dim and r["n"]==n
-                and r["version"]=="serial"), np.nan) for n in xs]
+    ys = [
+        next(
+            (
+                r["t_mean"]
+                for r in records
+                if r["dim"] == dim and r["n"] == n and r["version"] == "serial"
+            ),
+            np.nan,
+        )
+        for n in xs
+    ]
     ax.plot(xp, ys, "k--o", linewidth=2, markersize=6, label="Serial", zorder=5)
 
     for i, threads in enumerate(thread_configs):
-        yp = [next((r["t_mean"] for r in records if r["dim"]==dim and r["n"]==n
-                    and r["version"]=="parallel" and r["threads"]==threads), np.nan)
-              for n in xs]
-        ax.plot(xp, yp, color=COLORS[i%len(COLORS)], marker=MARKERS[i%len(MARKERS)],
-                linewidth=2, markersize=6,
-                label=f"{threads} hilo{'s' if threads>1 else ''}")
+        yp = [
+            next(
+                (
+                    r["t_mean"]
+                    for r in records
+                    if r["dim"] == dim
+                    and r["n"] == n
+                    and r["version"] == "parallel"
+                    and r["threads"] == threads
+                ),
+                np.nan,
+            )
+            for n in xs
+        ]
+        ax.plot(
+            xp,
+            yp,
+            color=COLORS[i % len(COLORS)],
+            marker=MARKERS[i % len(MARKERS)],
+            linewidth=2,
+            markersize=6,
+            label=f"{threads} hilo{'s' if threads>1 else ''}",
+        )
 
     ax.set_xlabel("Puntos (millones)", fontsize=11)
     ax.set_ylabel("Tiempo (s)", fontsize=11)
-    ax.set_title(f"Tiempos de Ejecucion — {dim}D  (k={K})",
-                 fontsize=12, fontweight="bold")
-    ax.legend(fontsize=9)
+    ax.set_title(
+        f"Tiempos de Ejecucion — {dim}D  (k={K})", fontsize=12, fontweight="bold"
+    )
+    ax.legend(fontsize=9, loc="upper right")
     ax.grid(True, alpha=0.3)
     ax.xaxis.set_major_formatter(ticker.FormatStrFormatter("%.1fM"))
 
 
 def generate_plots(records, thread_configs):
-    # Genera gráficos de speedup y tiempos si matplotlib está disponible.
+    # Genera gráficos de speedup y tiempos para cada dimensión con datos reales.
+    # FIX: usar solo las dims presentes en records, no asumir [2, 3]
     if not HAS_PLOT:
         return
-    for dim in [2, 3]:
+
+    dims_with_data = sorted(set(r["dim"] for r in records))
+
+    for dim in dims_with_data:
         fig, (a1, a2) = plt.subplots(1, 2, figsize=(14, 5))
         fig.suptitle(
             f"Evaluacion de Desempeno — K-Means con OpenMP ({dim}D)\n"
-            f"k={K}, 10 repeticiones por configuracion",
-            fontsize=13, fontweight="bold"
+            f"k={K}, {REPS} repeticiones por configuracion",
+            fontsize=13,
+            fontweight="bold",
         )
         plot_speedup(records, dim, a1, thread_configs)
         plot_times(records, dim, a2, thread_configs)
@@ -348,19 +482,37 @@ def generate_plots(records, thread_configs):
         plt.close()
         print(f"[Plot] {fname}")
 
-    fig, (a1, a2) = plt.subplots(1, 2, figsize=(14, 5))
-    fig.suptitle(
-        f"Speedup K-Means Paralelo (OpenMP) — 2D vs 3D\n"
-        f"k={K}, 10 repeticiones por configuracion",
-        fontsize=13, fontweight="bold"
-    )
-    plot_speedup(records, 2, a1, thread_configs)
-    plot_speedup(records, 3, a2, thread_configs)
-    a2.set_ylabel("")
-    plt.tight_layout()
-    plt.savefig("speedup_combined.png", dpi=150, bbox_inches="tight")
-    plt.close()
-    print("[Plot] speedup_combined.png")
+    # Gráfica combinada 2D vs 3D — solo si hay datos para ambas dimensiones
+    if 2 in dims_with_data and 3 in dims_with_data:
+        fig, (a1, a2) = plt.subplots(1, 2, figsize=(14, 5))
+        fig.suptitle(
+            f"Speedup K-Means Paralelo (OpenMP) — 2D vs 3D\n"
+            f"k={K}, {REPS} repeticiones por configuracion",
+            fontsize=13,
+            fontweight="bold",
+        )
+        plot_speedup(records, 2, a1, thread_configs)
+        plot_speedup(records, 3, a2, thread_configs)
+        a2.set_ylabel("")
+        plt.tight_layout()
+        plt.savefig("speedup_combined.png", dpi=150, bbox_inches="tight")
+        plt.close()
+        print("[Plot] speedup_combined.png")
+    elif len(dims_with_data) == 1:
+        # Solo hay una dimensión: guardar una gráfica de speedup individual limpia
+        dim = dims_with_data[0]
+        fig, ax = plt.subplots(figsize=(8, 5))
+        fig.suptitle(
+            f"Speedup K-Means Paralelo (OpenMP) — {dim}D\n"
+            f"k={K}, {REPS} repeticiones por configuracion",
+            fontsize=13,
+            fontweight="bold",
+        )
+        plot_speedup(records, dim, ax, thread_configs)
+        plt.tight_layout()
+        plt.savefig("speedup_combined.png", dpi=150, bbox_inches="tight")
+        plt.close()
+        print("[Plot] speedup_combined.png")
 
 
 # ─────────────────────────────────────────────
@@ -374,19 +526,42 @@ def parse_args():
     # --seed: semilla para reproducibilidad (default: SEED)
     # --sizes: lista de tamaños separados por coma (solo si no hay --input_csv)
     # --input_csv: archivo CSV de entrada (generado por synthetic_clusters.ipynb)
-    p = argparse.ArgumentParser(description="K-Means Benchmark Serial vs Paralelo (OpenMP)")
-    p.add_argument("--k",    type=int, default=K,
-                   help=f"Número de clusters (default: {K})")
-    p.add_argument("--reps", type=int, default=REPS,
-                   help=f"Número de repeticiones por configuración (default: {REPS})")
-    p.add_argument("--max_iter", type=int, default=MAX_ITER,
-                   help=f"Iteraciones máximas de k-means (default: {MAX_ITER})")
-    p.add_argument("--seed", type=int, default=SEED,
-                   help=f"Semilla para reproducibilidad (default: {SEED})")
-    p.add_argument("--sizes", type=str, default=None,
-                   help="Tamanios separados por coma, ej: 100000,500000 (ignorado si --input_csv)")
-    p.add_argument("--input_csv", type=str, default=None,
-                   help="Archivo CSV de entrada (generado por synthetic_clusters.ipynb)")
+    p = argparse.ArgumentParser(
+        description="K-Means Benchmark Serial vs Paralelo (OpenMP)"
+    )
+    p.add_argument(
+        "--k", type=int, default=K, help=f"Número de clusters (default: {K})"
+    )
+    p.add_argument(
+        "--reps",
+        type=int,
+        default=REPS,
+        help=f"Número de repeticiones por configuración (default: {REPS})",
+    )
+    p.add_argument(
+        "--max_iter",
+        type=int,
+        default=MAX_ITER,
+        help=f"Iteraciones máximas de k-means (default: {MAX_ITER})",
+    )
+    p.add_argument(
+        "--seed",
+        type=int,
+        default=SEED,
+        help=f"Semilla para reproducibilidad (default: {SEED})",
+    )
+    p.add_argument(
+        "--sizes",
+        type=str,
+        default=None,
+        help="Tamanios separados por coma, ej: 100000,500000 (ignorado si --input_csv)",
+    )
+    p.add_argument(
+        "--input_csv",
+        type=str,
+        default=None,
+        help="Archivo CSV de entrada (generado por synthetic_clusters.ipynb)",
+    )
     return p.parse_args()
 
 
@@ -421,7 +596,9 @@ def main():
             print(f"[ERROR] Binario no encontrado: {b}")
             print("  Compila con:")
             print("    g++ -O2 -std=c++17 -o kmeans_serial kmeans_serial.cpp")
-            print("    g++ -O2 -std=c++17 -fopenmp -o kmeans_parallel kmeans_parallel.cpp")
+            print(
+                "    g++ -O2 -std=c++17 -fopenmp -o kmeans_parallel kmeans_parallel.cpp"
+            )
             sys.exit(1)
 
     # Configuración de hilos según CPU
@@ -440,8 +617,13 @@ def main():
     print(f"{'='*55}")
 
     # Ejecutar experimentos, guardar resultados y gráficas
-    records = run_experiment(reps=args.reps, thread_configs=thread_configs,
-                             dims=detected_dims, n_sizes=detected_n, input_csv=input_csv_path)
+    records = run_experiment(
+        reps=args.reps,
+        thread_configs=thread_configs,
+        dims=detected_dims,
+        n_sizes=detected_n,
+        input_csv=input_csv_path,
+    )
     save_results(records, reps=args.reps)
     generate_plots(records, thread_configs)
 
@@ -452,12 +634,19 @@ def main():
     for dim in detected_dims:
         print(f"\n  {dim}D:")
         for threads in thread_configs:
-            sp_vals = [r["speedup"] for r in records
-                       if r["dim"]==dim and r["version"]=="parallel"
-                       and r["threads"]==threads and not np.isnan(r["speedup"])]
+            sp_vals = [
+                r["speedup"]
+                for r in records
+                if r["dim"] == dim
+                and r["version"] == "parallel"
+                and r["threads"] == threads
+                and not np.isnan(r["speedup"])
+            ]
             if sp_vals:
-                print(f"    {threads:>2} hilos -> max = {max(sp_vals):.2f}x  "
-                      f"media = {np.mean(sp_vals):.2f}x")
+                print(
+                    f"    {threads:>2} hilos -> max = {max(sp_vals):.2f}x  "
+                    f"media = {np.mean(sp_vals):.2f}x"
+                )
 
 
 if __name__ == "__main__":
