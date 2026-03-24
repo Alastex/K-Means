@@ -71,6 +71,7 @@ if sys.executable != venv_python:
 #  Parametros globales (pueden sobreescribirse via CLI)
 # ─────────────────────────────────────────────
 # Configuración por defecto del benchmark
+# Tamaños exactos del experimento (PDF del proyecto)
 POINT_SIZES = [100_000, 200_000, 300_000, 400_000, 600_000, 800_000, 1_000_000]
 K = 8  # número de clusters a usar
 MAX_ITER = 300  # iteraciones máximas por ejecución de k-means
@@ -139,25 +140,26 @@ def load_external_csv(path):
 def generate_csv(n_points, dims, seed=SEED):
     # Crea carpeta de datos si no existe e intenta reutilizar archivos existentes
     os.makedirs(DATA_DIR, exist_ok=True)
-    path = f"{DATA_DIR}/{n_points}_{dims}d_std1.csv"
+    path = f"{DATA_DIR}/{n_points}_{dims}d.csv"
     if os.path.exists(path):
         return path
 
     print(f"\n  Generando {n_points:,} puntos {dims}D ...", end=" ", flush=True)
 
-    # FIX 1: sin cluster_std fijo → sklearn default = 1.0
-    # Con cluster_std=0.04 los clusters son triviales y K-Means converge
-    # en 2-5 iteraciones, dejando muy poco trabajo para paralelizar.
-    # Con el default (1.0) los clusters se solapan y el algoritmo necesita
-    # 80-200 iteraciones, que es donde el speedup paralelo se manifiesta.
-    pts = make_blobs(
+    # Parámetros exactos del notebook synthetic_clusters_kmeans.ipynb:
+    #   cluster_std=0.04  → clusters compactos, bien separados
+    #   random_state=7    → misma semilla que el notebook
+    #   center_box=(0,1)  → centros en el cubo unitario
+    #   np.abs + round 3  → solo valores positivos, 3 decimales
+    pts, _ = make_blobs(
         n_samples=n_points,
         centers=K,
         n_features=dims,
-        random_state=seed,
-    )[0]
-
-    pts = np.round(pts, 6)
+        cluster_std=0.04,
+        random_state=7,
+        center_box=(0, 1.0),
+    )
+    pts = np.round(np.abs(pts), 3)
     np.savetxt(path, pts, delimiter=",", fmt="%.3f")
 
     print(f"listo -> {path}")
@@ -396,7 +398,7 @@ def plot_speedup(records, dim, ax, thread_configs):
     ax.set_title(
         f"Speedup K-Means OpenMP — {dim}D  (k={K})", fontsize=12, fontweight="bold"
     )
-    ax.legend(fontsize=9, loc="upper left")
+    ax.legend(fontsize=9, loc="upper right")
     ax.grid(True, alpha=0.3)
     ax.set_ylim(bottom=0)
     ax.xaxis.set_major_formatter(ticker.FormatStrFormatter("%.1fM"))
@@ -451,7 +453,7 @@ def plot_times(records, dim, ax, thread_configs):
     ax.set_title(
         f"Tiempos de Ejecucion — {dim}D  (k={K})", fontsize=12, fontweight="bold"
     )
-    ax.legend(fontsize=9)
+    ax.legend(fontsize=9, loc="upper right")
     ax.grid(True, alpha=0.3)
     ax.xaxis.set_major_formatter(ticker.FormatStrFormatter("%.1fM"))
 
