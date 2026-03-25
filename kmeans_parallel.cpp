@@ -3,24 +3,34 @@
  *  K-Means — Versión Paralela con OpenMP (Proyecto Apertura)
  *  Cómputo Paralelo y en la Nube — ITAM 2026
  * ============================================================
- *  Estrategia de paralelización:
  *
- *  Paso 2 — E-step (Asignación):
- *    El loop principal sobre los n puntos es embarazosamente
- *    paralelo: cada punto calcula su distancia a los k centroides
- *    de forma completamente independiente.
- *    → #pragma omp parallel for reduction(+:changes)
- *      con schedule(static) para distribución uniforme.
+ *  Esta versión toma el algoritmo serial y paraleliza exactamente
+ *  las dos operaciones que dominan el tiempo de ejecución:
+ *  la asignación de clusters (E-step) y la actualización de
+ *  centroides (M-step).
  *
- *  Paso 3 — M-step (Actualización de centroides):
- *    Cada hilo acumula sumas parciales en arreglos locales
- *    (thread-private), evitando condiciones de carrera sin
- *    usar atomic/critical en el loop caliente.
- *    Al final, una sección crítica combina los resultados.
- *    → Pattern: partial-sum reduction manual sobre vectores.
+ *  Respecto a la versión serial, hay tres decisiones de diseño
+ *  importantes que se explican a detalle abajo:
+ *
+ *  1. struct Point en lugar de vector<double>
+ *     El layout de memoria importa para el paralelismo: con un
+ *     struct fijo el procesador puede hacer prefetch y el compilador
+ *     puede vectorizar. Con vector<double>, cada punto es un heap
+ *     allocation separado que rompe la localidad de caché.
+ *
+ *  2. SoA (Structure of Arrays) para los acumuladores del M-step
+ *     En lugar de all_sums[tid][c][d] con triple indirección, usamos
+ *     lsX[tid][c], lsY[tid][c], lsZ[tid][c] — arreglos planos que
+ *     el compilador puede vectorizar con AVX2/SSE4.
+ *
+ *  3. Fusión E-step + M-step con nowait
+ *     Elimina una barrera de sincronización por iteración del loop
+ *     de Lloyd. Con datos que convergen en pocas iteraciones, cada
+ *     barrera eliminada tiene impacto visible.
  *
  *  Build:
- *    g++ -O2 -std=c++17 -fopenmp -o kmeans_parallel kmeans_parallel.cpp
+ *    g++ -O3 -std=c++17 -fopenmp -o kmeans_parallel kmeans_parallel.cpp
+ *    (Nota: -O3 en lugar de -O2 activa vectorización SIMD más agresiva)
  *
  *  Uso:
  *    ./kmeans_parallel <csv_file> <k> <num_threads> [max_iter=300] [seed=42]
@@ -39,7 +49,7 @@
 #include <iomanip>
 #include <iostream>
 #include <limits>
-#include <omp.h>
+#include <omp.h>        // API de OpenMP: omp_get_thread_num, omp_set_num_threads, etc.
 #include <random>
 #include <sstream>
 #include <string>
@@ -48,21 +58,39 @@
 using namespace std;
 
 // ─────────────────────────────────────────────
-//  Tipos
-//  FIX 3: struct fijo en lugar de vector<double>
-//  Con vector<double>, cada uno de los n puntos es un heap
-//  allocation separado. Con struct Point los datos quedan en
-//  un bloque contiguo de memoria — el CPU puede hacer prefetch
-//  y el compilador puede vectorizar (SIMD) los accesos.
+//  struct Point — layout fijo en lugar de vector<double>
+//
+//  Esta es la diferencia de representación más importante
+//  respecto a la versión serial.
+//
+//  Con vector<double>, cada punto es:
+//    [ puntero(8B) | tamaño(8B) | capacidad(8B) ] → datos en el heap
+//  Con un millón de puntos tenemos un millón de punteros esparcidos
+//  por el heap. El procesador no puede prefetchear la memoria porque
+//  no sabe dónde está el siguiente punto.
+//
+//  Con struct Point { double x, y, z }, los datos quedan así en RAM:
+//    [x0,y0,z0, x1,y1,z1, x2,y2,z2, ...]
+//  Un bloque contiguo de 24 bytes por punto. El hardware prefetcher
+//  del CPU detecta el patrón secuencial y carga las líneas de caché
+//  antes de que el código las necesite.
+//
+//  La limitación: este struct solo funciona hasta 3D. Si necesitáramos
+//  dimensionalidad arbitraria, habría que volver a vector<double> o
+//  usar un arreglo fijo con una constante de compilación.
 // ─────────────────────────────────────────────
 struct Point {
     double x = 0, y = 0, z = 0;
 };
 using Dataset  = vector<Point>;
-using Centroid = Point;
+using Centroid = Point;  // mismo tipo — son intercambiables semánticamente
 
 // ─────────────────────────────────────────────
-//  I/O
+//  load_csv
+//
+//  Igual que en el serial pero adaptado a struct Point.
+//  dim se pasa por referencia para que el caller pueda saber
+//  si el CSV era 2D o 3D sin leerlo dos veces.
 // ─────────────────────────────────────────────
 Dataset load_csv(const string& path, int& dim) {
     ifstream file(path);
@@ -104,16 +132,32 @@ void save_centroids(const string& path, const vector<Centroid>& centroids) {
 }
 
 // ─────────────────────────────────────────────
-//  Distancia euclidiana al cuadrado (inline)
+//  sq_dist — versión optimizada para struct Point
+//
+//  Al tener campos con nombre (x, y, z) en lugar de un loop genérico,
+//  el compilador genera exactamente 3 restas, 3 multiplicaciones y
+//  2 sumas — sin overhead de loop ni contador. Con -O3 esto puede
+//  compilar a una sola instrucción SIMD que procesa las 3 componentes
+//  en paralelo dentro del mismo core.
+//
+//  Comparación con el serial:
+//    Serial:   for (d=0..dim) diff = a[d]-b[d]; s += diff*diff;
+//    Paralelo: dx=a.x-b.x; dy=...; dz=...; return dx*dx+dy*dy+dz*dz;
+//  Mismo resultado, pero sin el overhead del loop y con mejor
+//  oportunidad de vectorización.
 // ─────────────────────────────────────────────
-// FIX 3: sq_dist sobre struct fijo — sin loop, sin indirección
 inline double sq_dist(const Point& a, const Centroid& b) {
     double dx = a.x - b.x, dy = a.y - b.y, dz = a.z - b.z;
     return dx*dx + dy*dy + dz*dz;
 }
 
 // ─────────────────────────────────────────────
-//  K-Means++ — inicialización (serial — se ejecuta una vez)
+//  kmeanspp_init — igual que en el serial, corre una sola vez
+//
+//  Intencionalmente no paralelizado: corre una vez antes del loop
+//  de Lloyd y su costo (O(k*n)) es despreciable frente al costo
+//  total del algoritmo. Añadir pragmas aquí complicaría el código
+//  sin ganancia medible.
 // ─────────────────────────────────────────────
 vector<Centroid> kmeanspp_init(const Dataset& data, int k, mt19937& rng) {
     size_t n = data.size();
@@ -138,124 +182,38 @@ vector<Centroid> kmeanspp_init(const Dataset& data, int k, mt19937& rng) {
 }
 
 // ─────────────────────────────────────────────
-//  Paso 2 — Asignación paralela (E-step)
+//  kmeans_parallel — driver principal con E-step y M-step fusionados
 //
-//  Esta función hace exactamente lo mismo que assign_clusters() en el
-//  código serial, pero paraleliza el loop que itera sobre cada punto.
-//  Comparación con serial:
-//   - Serial: loop for (i=0..n) único y secuencial.
-//   - Paralelo: #pragma omp parallel for, cada hilo procesa un subconjunto.
-//  - `labels` es shared; cada hilo actualiza su índice i único.
-//  - `changes` se acumula con reduction(+:changes) (evita critical).
+//  La decisión de diseño más importante aquí es fusionar ambos pasos
+//  en una sola región paralela con nowait. Explicación:
 //
-//  Nota clave: `sq_dist` sigue siendo la misma función serial. No hay
-//  atomics en el inner loop: la independencia por punto lo permite.
-// ─────────────────────────────────────────────
-int assign_clusters_parallel(const Dataset& data,
-                              const vector<Centroid>& centroids,
-                              vector<int>& labels) {
-    int    changes = 0;
-    int    k       = static_cast<int>(centroids.size());
-    size_t n       = data.size();
-
-    #pragma omp parallel for schedule(static) reduction(+:changes)
-    for (size_t i = 0; i < n; ++i) {
-        double best_d = numeric_limits<double>::infinity();
-        int    best_c = 0;
-        for (int c = 0; c < k; ++c) {
-            double d = sq_dist(data[i], centroids[c]);
-            if (d < best_d) { best_d = d; best_c = c; }
-        }
-        if (labels[i] != best_c) {
-            labels[i] = best_c;
-            ++changes;
-        }
-    }
-    return changes;
-}
-
-// ─────────────────────────────────────────────
-//  Paso 3 — Actualización paralela de centroides (M-step)
+//  Sin fusión (lo que hacíamos antes):
+//    Iteración:
+//      [E-step paralelo] → BARRERA → [M-step paralelo] → BARRERA → check
 //
-//  Comparado con la versión serial (update_centroids):
-//   - Serial: suma directa global y conteo global en un solo loop.
-//   - Paralelo: cada hilo acumula en estructuras locales (all_sums/all_counts)
-//     para evitar condiciones de carrera sobre los datos compartidos.
-//   - Luego se reduce (serialmente) a global_sums/global_counts.
-//   - Evita bloqueo en el loop caliente, y el overhead de reducción es menor.
+//  Con fusión y nowait:
+//    Iteración:
+//      [E-step + M-step en una región] → BARRERA → check
 //
-//  Paralelismo:
-//    #pragma omp parallel + #pragma omp for sobre i
-//    cada hilo trabaja con su índice tid y datos thread-private.
+//  Nos ahorramos una barrera por iteración. Con datos que convergen
+//  en 10 iteraciones, son 10 barreras menos — cada una cuesta entre
+//  5 y 50 microsegundos dependiendo del hardware y el número de hilos.
 //
-//  Elemento clave: no existe concurrencia en write sobre centroids/data durante
-//  el loop pesado; solo en la fase de reducción (menor costo).
-// ─────────────────────────────────────────────
-// FIX 3: SoA (Structure of Arrays) — accesos planos de dos niveles
-// en lugar de all_sums[tid][c][d] con triple indirección.
-// Permite al compilador vectorizar con AVX2/SSE4 en el Ryzen 7 6800HS.
-//
-// Signatura extendida: recibe los buffers pre-alocados para no
-// hacer malloc/free en cada iteración del loop de Lloyd.
-void update_centroids_parallel(const Dataset& data,
-                                const vector<int>& labels,
-                                vector<Centroid>& centroids,
-                                vector<vector<double>>& lsX,
-                                vector<vector<double>>& lsY,
-                                vector<vector<double>>& lsZ,
-                                vector<vector<int>>&    lsCnt) {
-    int    k        = static_cast<int>(centroids.size());
-    size_t n        = data.size();
-    int    nthreads = omp_get_max_threads();
-
-    #pragma omp parallel
-    {
-        int tid = omp_get_thread_num();
-
-        // Reset local sin re-alocar (fill es O(k) — despreciable)
-        fill(lsX[tid].begin(), lsX[tid].end(), 0.0);
-        fill(lsY[tid].begin(), lsY[tid].end(), 0.0);
-        fill(lsZ[tid].begin(), lsZ[tid].end(), 0.0);
-        fill(lsCnt[tid].begin(), lsCnt[tid].end(), 0);
-
-        // M-step: acumular en SoA local — sin lock, sin false sharing
-        #pragma omp for schedule(static)
-        for (size_t i = 0; i < n; ++i) {
-            int c = labels[i];
-            lsX[tid][c] += data[i].x;
-            lsY[tid][c] += data[i].y;
-            lsZ[tid][c] += data[i].z;
-            ++lsCnt[tid][c];
-        }
-    }
-
-    // Reducción serial: O(nthreads * k) — con k=8 y 32 hilos son 256 ops
-    for (int c = 0; c < k; ++c) {
-        double sx = 0, sy = 0, sz = 0;
-        int    cnt = 0;
-        for (int t = 0; t < nthreads; ++t) {
-            sx  += lsX[t][c];
-            sy  += lsY[t][c];
-            sz  += lsZ[t][c];
-            cnt += lsCnt[t][c];
-        }
-        if (cnt > 0) {
-            centroids[c].x = sx / cnt;
-            centroids[c].y = sy / cnt;
-            centroids[c].z = sz / cnt;
-        }
-    }
-}
-
-// ─────────────────────────────────────────────
-//  K-Means paralelo — driver principal
-//  Retorna tiempo de ejecución en segundos
+//  La fusión es segura porque schedule(static) garantiza que el hilo T
+//  procesa exactamente el mismo rango de índices [a, b) en AMBOS loops.
+//  Cuando el hilo T empieza el M-step para el índice i, ya escribió
+//  labels[i] en el E-step — nadie más toca ese índice.
 // ─────────────────────────────────────────────
 double kmeans_parallel(const Dataset& data, int k, int num_threads,
                        int max_iter = 300, unsigned seed = 42,
                        bool verbose = true,
                        bool save = true) {
     size_t n = data.size();
+
+    // omp_set_num_threads fija el número de hilos que usarán TODAS las
+    // regiones paralelas de este proceso a partir de este punto.
+    // Alternativa: OMP_NUM_THREADS env var, pero el parámetro explícito
+    // es más predecible en benchmarks.
     omp_set_num_threads(num_threads);
 
     mt19937 rng(seed);
@@ -264,8 +222,22 @@ double kmeans_parallel(const Dataset& data, int k, int num_threads,
 
     int nthreads = num_threads;
 
-    // FIX 3: Pre-alocar buffers SoA UNA sola vez fuera del loop.
-    // Sin esto se hacen malloc/free en cada iteración.
+    // ── Pre-alocación de buffers SoA fuera del loop ─────────────────────
+    //
+    // Por qué alocar aquí y no dentro de update_centroids_parallel:
+    // Si alocaramos dentro del loop de Lloyd, haríamos malloc/free en
+    // cada iteración. Con n=1M y 10 iteraciones, son 10 mallocs de
+    // nthreads * k doubles cada uno. No son costosos individualmente,
+    // pero suman y fragmentan el heap.
+    //
+    // La alternativa clásica sería pasar los buffers como parámetros,
+    // pero como fusionamos E y M en una sola región paralela, los
+    // buffers viven en el scope del driver directamente.
+    //
+    // SoA: lsX[tid][c] en lugar de sums[tid][c].x
+    // Ventaja: lsX[0..nthreads-1][c] son nthreads doubles consecutivos
+    // en memoria para el cluster c. El compilador puede vectorizar la
+    // reducción final con instrucciones SIMD.
     vector<vector<double>> lsX(nthreads, vector<double>(k, 0.0));
     vector<vector<double>> lsY(nthreads, vector<double>(k, 0.0));
     vector<vector<double>> lsZ(nthreads, vector<double>(k, 0.0));
@@ -275,23 +247,49 @@ double kmeans_parallel(const Dataset& data, int k, int num_threads,
 
     int iter = 0;
     for (iter = 1; iter <= max_iter; ++iter) {
-        // FIX 3: E-step y M-step en una sola región paralela con nowait.
-        // nowait elimina la barrera entre el primer omp for y el segundo:
-        // cada hilo empieza a acumular en cuanto termina su chunk de asignación.
-        // Es seguro porque schedule(static) garantiza que ambos loops asignan
-        // exactamente el mismo rango de índices al mismo hilo.
+
         int changes = 0;
 
+        // ── Región paralela: E-step + M-step fusionados ─────────────────
+        //
+        // #pragma omp parallel abre el team de hilos y define el scope
+        // compartido. Todo lo declarado DENTRO de este bloque es
+        // thread-private (tid, best_d, best_c, etc.).
+        // Todo lo declarado FUERA (data, centroids, labels, lsX...) es
+        // compartido por todos los hilos — pero cada uno escribe en
+        // posiciones distintas, así que no hay races.
+        //
+        // reduction(+:changes): OpenMP crea una copia privada de changes
+        // en cada hilo (inicializada a 0), y al cerrar el parallel suma
+        // todas las copias en la variable original. Es equivalente a
+        // atomic pero sin serializar el loop interno.
         #pragma omp parallel reduction(+:changes)
         {
             int tid = omp_get_thread_num();
 
-            fill(lsX[tid].begin(), lsX[tid].end(), 0.0);
-            fill(lsY[tid].begin(), lsY[tid].end(), 0.0);
-            fill(lsZ[tid].begin(), lsZ[tid].end(), 0.0);
+            // Reset de los buffers locales. fill() es O(k) — con k=8
+            // son 8 asignaciones, completamente despreciable.
+            // Nota: hacemos esto DENTRO de la región paralela para que
+            // cada hilo limpie su propia fila, en paralelo con los demás.
+            fill(lsX[tid].begin(),   lsX[tid].end(),   0.0);
+            fill(lsY[tid].begin(),   lsY[tid].end(),   0.0);
+            fill(lsZ[tid].begin(),   lsZ[tid].end(),   0.0);
             fill(lsCnt[tid].begin(), lsCnt[tid].end(), 0);
 
-            // E-step: nowait — el hilo no espera a los demás
+            // ── E-step paralelo con nowait ──────────────────────────────
+            //
+            // schedule(static): divide [0, n) en bloques de n/nthreads y
+            // asigna cada bloque a un hilo en tiempo de compilación.
+            // Es la política correcta aquí porque el trabajo por iteración
+            // es homogéneo: todas las distancias cuestan lo mismo.
+            // schedule(dynamic) añadiría overhead de sincronización sin
+            // ningún beneficio de balance de carga.
+            //
+            // nowait: el hilo NO espera a que los demás terminen el E-step
+            // antes de pasar al M-step. Es seguro porque:
+            //   1. schedule(static) garantiza mismo rango en ambos loops
+            //   2. El hilo T terminó de escribir labels[i] para su rango
+            //      antes de leerlos en el M-step para ese mismo rango
             #pragma omp for schedule(static) nowait
             for (size_t i = 0; i < n; ++i) {
                 double best_d = numeric_limits<double>::infinity();
@@ -302,11 +300,24 @@ double kmeans_parallel(const Dataset& data, int k, int num_threads,
                 }
                 if (labels[i] != best_c) {
                     labels[i] = best_c;
-                    ++changes;
+                    ++changes;  // se suma en la reducción al cerrar el parallel
                 }
             }
 
-            // M-step: mismo rango que E-step → labels[i] ya escrito
+            // ── M-step paralelo con SoA ─────────────────────────────────
+            //
+            // Cada hilo acumula en su propia fila lsX[tid], lsY[tid], lsZ[tid].
+            // No hay dos hilos escribiendo en la misma posición de memoria,
+            // por lo que no se necesita atomic, critical, ni lock de ningún tipo.
+            //
+            // Si usáramos un arreglo global sums[c] sin protección, dos hilos
+            // que tengan puntos del mismo cluster c harían:
+            //   hilo 0: sums[c] += data[i0].x   ← lee y escribe
+            //   hilo 1: sums[c] += data[i1].x   ← lee y escribe (race condition)
+            //
+            // Con lsX[tid][c] cada hilo escribe en su propia celda:
+            //   hilo 0: lsX[0][c] += data[i0].x  ← solo el hilo 0 toca lsX[0]
+            //   hilo 1: lsX[1][c] += data[i1].x  ← solo el hilo 1 toca lsX[1]
             #pragma omp for schedule(static)
             for (size_t i = 0; i < n; ++i) {
                 int c = labels[i];
@@ -315,19 +326,29 @@ double kmeans_parallel(const Dataset& data, int k, int num_threads,
                 lsZ[tid][c] += data[i].z;
                 ++lsCnt[tid][c];
             }
-        }
 
-        // Reducción serial de buffers SoA
+        } // ← barrera implícita: todos los hilos terminaron E+M antes de continuar
+
+        // ── Reducción serial de los buffers SoA ─────────────────────────
+        //
+        // Costo: O(nthreads * k). Con 32 hilos y k=8 son 256 sumas.
+        // Frente al O(n * k) del loop paralelo (8 millones de distancias
+        // con n=1M y k=8), esto es 31,250x más pequeño — completamente
+        // despreciable. No tiene sentido paralelizar esto.
         for (int c = 0; c < k; ++c) {
-            double sx = 0, sy = 0, sz = 0; int cnt = 0;
+            double sx = 0, sy = 0, sz = 0;
+            int    cnt = 0;
             for (int t = 0; t < nthreads; ++t) {
-                sx += lsX[t][c]; sy += lsY[t][c]; sz += lsZ[t][c];
+                sx  += lsX[t][c];
+                sy  += lsY[t][c];
+                sz  += lsZ[t][c];
                 cnt += lsCnt[t][c];
             }
+            // El guard evita división por cero si un cluster queda vacío
             if (cnt > 0) {
-                centroids[c].x = sx/cnt;
-                centroids[c].y = sy/cnt;
-                centroids[c].z = sz/cnt;
+                centroids[c].x = sx / cnt;
+                centroids[c].y = sy / cnt;
+                centroids[c].z = sz / cnt;
             }
         }
 
@@ -346,6 +367,7 @@ double kmeans_parallel(const Dataset& data, int k, int num_threads,
     double elapsed = chrono::duration<double>(t1 - t0).count();
 
     if (verbose) {
+        // El benchmark parsea "tiempo=X.XXXXs" de este output
         cout << "[Paralelo] hilos=" << num_threads
              << "  iters=" << iter
              << "  tiempo=" << fixed << setprecision(4) << elapsed << "s\n";
@@ -366,6 +388,11 @@ double kmeans_parallel(const Dataset& data, int k, int num_threads,
 
 // ─────────────────────────────────────────────
 //  main
+//
+//  Igual que en el serial: parsear, cargar, ejecutar.
+//  La diferencia es num_threads como argumento obligatorio,
+//  para que el benchmark pueda controlar el número de hilos
+//  desde Python sin variables de entorno.
 // ─────────────────────────────────────────────
 int main(int argc, char* argv[]) {
     if (argc < 4) {
